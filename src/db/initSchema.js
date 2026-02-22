@@ -1,0 +1,303 @@
+const fs = require("fs");
+const path = require("path");
+const { query } = require("./pool");
+
+async function tableExists(table) {
+  const r = await query("SELECT to_regclass($1) AS t", [`public.${table}`]);
+  return Boolean(r.rows?.[0]?.t);
+}
+
+async function columnExists(table, column) {
+  const r = await query(
+    `SELECT 1
+     FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = $1
+       AND column_name = $2
+     LIMIT 1`,
+    [table, column]
+  );
+  return r.rowCount > 0;
+}
+
+async function constraintExists(constraintName) {
+  const r = await query(
+    `SELECT 1
+     FROM pg_constraint
+     WHERE conname = $1
+     LIMIT 1`,
+    [constraintName]
+  );
+  return r.rowCount > 0;
+}
+
+async function ensureColumn(table, column, typeSql) {
+  if (!(await tableExists(table))) return;
+  if (await columnExists(table, column)) return;
+  await query(`ALTER TABLE ${table} ADD COLUMN ${column} ${typeSql};`);
+}
+
+async function ensureTable(table, createSql) {
+  if (await tableExists(table)) return;
+  await query(createSql);
+}
+
+async function ensureFK({ name, table, column, refTable, refColumn = "id", onDelete = "SET NULL" }) {
+  if (await constraintExists(name)) return;
+  // Only add FK if both tables exist and column exists.
+  if (!(await tableExists(table))) return;
+  if (!(await tableExists(refTable))) return;
+  if (!(await columnExists(table, column))) return;
+
+  await query(
+    `ALTER TABLE ${table}
+     ADD CONSTRAINT ${name}
+     FOREIGN KEY (${column}) REFERENCES ${refTable}(${refColumn})
+     ON DELETE ${onDelete};`
+  );
+}
+
+async function ensureUserRoleEnum() {
+  // Create enum only if missing. If it already exists, do nothing.
+  await query(
+    `DO $$
+     BEGIN
+       IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'user_role') THEN
+         CREATE TYPE user_role AS ENUM ('ADMIN','HOD','TA','HR','EMP','PLANNING');
+       END IF;
+     END $$;`
+  );
+}
+
+async function ensureUserStatusEnum() {
+  // Create enum only if missing. If it already exists, do nothing.
+  await query(
+    `DO $$
+     BEGIN
+       IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'user_status') THEN
+         CREATE TYPE user_status AS ENUM ('ACTIVE','PENDING_HOD','PENDING_ADMIN','DISABLED');
+       END IF;
+     END $$;`
+  );
+
+  // Older DBs may have been created before PENDING_ADMIN existed.
+  await ensureEnumValue("user_status", "PENDING_ADMIN");
+}
+
+
+async function enumValueExists(enumName, value) {
+  const r = await query(
+    `SELECT 1
+     FROM pg_enum e
+     JOIN pg_type t ON t.oid = e.enumtypid
+     WHERE t.typname = $1 AND e.enumlabel = $2
+     LIMIT 1`,
+    [enumName, value]
+  );
+  return r.rowCount > 0;
+}
+
+async function ensureEnumValue(enumName, value) {
+  if (await enumValueExists(enumName, value)) return;
+  // Value must be a literal in ALTER TYPE; keep it safe by only allowing A-Z0-9_.
+  if (!/^[A-Z0-9_]+$/.test(value)) throw new Error("Unsafe enum value");
+  await query(`ALTER TYPE ${enumName} ADD VALUE '${value}';`);
+}
+
+async function migrateSchema() {
+  // Idempotent, safe migrations for existing databases.
+  // This prevents "Server error" on HOD employee endpoints when new columns are introduced.
+
+  // Some older DBs were created before the enum existed.
+  try {
+    await ensureUserRoleEnum();
+    await ensureUserStatusEnum();
+    await ensureEnumValue("user_role", "PLANNING");
+  } catch (e) {
+    // If enum creation fails for any reason, skip (existing DBs might already have it).
+    console.warn("initSchema: user_role enum ensure skipped:", e.message);
+  }
+
+  // Some earlier code paths referenced a LOCKED request status.
+  // If the DB enum is missing that value, any query comparing status='LOCKED'
+  // will hard-fail with: "invalid input value for enum request_status".
+  // Keeping this idempotent ensures Railway persistent DBs won't crash after updates.
+  try {
+    await ensureEnumValue("request_status", "LOCKED");
+  } catch (e) {
+    console.warn("initSchema: request_status LOCKED ensure skipped:", e.message);
+  }
+
+  // Employees default route/sub-route support (used by HOD add employee form)
+  await ensureColumn("employees", "default_route_id", "INTEGER");
+  await ensureColumn("transport_request_employees", "assigned_vehicle_id", "INTEGER");
+  await ensureColumn("employees", "default_sub_route_id", "INTEGER");
+
+  // Vehicles extra identifiers (TA UI uses these)
+  await ensureColumn("vehicles", "registration_no", "TEXT");
+  await ensureColumn("vehicles", "fleet_no", "TEXT");
+
+  // Vehicles can serve multiple routes (TA UI uses checkboxes)
+  await ensureTable(
+    "vehicle_routes",
+    `CREATE TABLE vehicle_routes (
+      id SERIAL PRIMARY KEY,
+      vehicle_id INT NOT NULL,
+      route_id INT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT fk_vehicle_routes_vehicle
+        FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE,
+      CONSTRAINT fk_vehicle_routes_route
+        FOREIGN KEY (route_id) REFERENCES routes(id) ON DELETE CASCADE,
+      CONSTRAINT uq_vehicle_routes UNIQUE (vehicle_id, route_id)
+    );`
+  );
+
+  // Request assignment advanced fields (TA overbook/notes)
+  await ensureColumn("request_assignments", "instructions", "TEXT");
+  await ensureColumn("request_assignments", "overbook_amount", "INT NOT NULL DEFAULT 0");
+  await ensureColumn("request_assignments", "overbook_reason", "TEXT");
+  await ensureColumn("request_assignments", "overbook_status", "TEXT NOT NULL DEFAULT 'NONE'");
+
+  // ---------------------------------------------------------------------------
+  // RULE: A vehicle can be assigned to ONLY ONE route within the SAME request.
+  // Enforce at DB-level (unique index) + cleanup any accidental duplicates.
+  // ---------------------------------------------------------------------------
+  try {
+    // Cleanup duplicates (keep newest row by id)
+    await query(
+      `DELETE FROM request_assignments a
+       USING request_assignments b
+       WHERE a.request_id = b.request_id
+         AND a.vehicle_id = b.vehicle_id
+         AND a.id < b.id;`
+    );
+    await query(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_request_assignments_request_vehicle ON request_assignments(request_id, vehicle_id);"
+    );
+  } catch (e) {
+    // If existing data violates the rule badly or permissions differ, skip hard enforcement.
+    // API-level validation will still prevent new violations.
+    console.warn("initSchema: request_assignments unique vehicle-per-request ensure skipped:", e.message);
+  }
+
+  // Password reset (OTP) support
+  await ensureColumn("users", "previous_password_hash", "TEXT");
+
+  // 2FA (TOTP) per-user opt-in
+  await ensureColumn("users", "twofa_enabled", "BOOLEAN NOT NULL DEFAULT FALSE");
+  await ensureColumn("users", "twofa_secret", "TEXT");
+  await ensureColumn("users", "twofa_temp_secret", "TEXT");
+  await ensureColumn("users", "twofa_backup_codes", "JSONB");
+  await ensureColumn("users", "twofa_last_used_step", "BIGINT");
+
+
+  await ensureTable(
+    "password_reset_requests",
+    `CREATE TABLE password_reset_requests (
+      id SERIAL PRIMARY KEY,
+      user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      otp_hash TEXT NOT NULL,
+      otp_salt TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      consumed_at TIMESTAMPTZ NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      requested_ip TEXT NULL
+    );`
+  );
+
+  // Indexes (idempotent)
+  try {
+    await query("CREATE INDEX IF NOT EXISTS idx_prr_user_created ON password_reset_requests(user_id, created_at DESC);");
+    await query("CREATE INDEX IF NOT EXISTS idx_prr_user_active ON password_reset_requests(user_id) WHERE consumed_at IS NULL;");
+  } catch (e) {
+    console.warn("initSchema: password reset indexes ensure skipped:", e.message);
+  }
+
+  // FK constraints (only added if not already present)
+  await ensureFK({
+    name: "fk_emp_default_route",
+    table: "employees",
+    column: "default_route_id",
+    refTable: "routes",
+    onDelete: "SET NULL",
+  });
+
+  await ensureFK({
+    name: "fk_emp_default_sub",
+    table: "employees",
+    column: "default_sub_route_id",
+    refTable: "sub_routes",
+    onDelete: "SET NULL",
+  });
+}
+
+
+async function runSqlFile(filename) {
+  const p = path.join(__dirname, filename);
+  const sql = fs.readFileSync(p, "utf-8");
+  await query(sql);
+}
+
+async function resetForTest() {
+  // ⚠️ Test-only: wipes all data but keeps schema
+  // Use DB_SEED_RESET=true
+  await query(`
+    TRUNCATE TABLE
+      approvals_audit,
+      request_assignments,
+      transport_request_employees,
+      transport_requests,
+      vehicle_routes,
+      vehicles,
+      sub_routes,
+      routes,
+      users,
+      employees,
+      departments
+    RESTART IDENTITY
+    CASCADE;
+  `);
+}
+
+async function initSchema() {
+  const schemaPath = path.join(__dirname, "schema.sql");
+  const schemaSql = fs.readFileSync(schemaPath, "utf-8");
+
+  // Fresh DB bootstrap
+  const hasDepartments = await tableExists("departments");
+  if (!hasDepartments) {
+    console.log("DB init: fresh schema bootstrap...");
+    await query(schemaSql);
+  }
+
+  // Always run safe migrations (important for Railway where DB persists)
+  console.log("DB init: running safe migrations...");
+  await migrateSchema();
+
+  // Optional: test seed data (easy to disable later)
+  // Set DB_SEED_TEST=true to seed once when DB is empty.
+  // Set DB_SEED_RESET=true to wipe data and reseed (TEST ONLY).
+  const seedEnabled = String(process.env.DB_SEED_TEST || "").toLowerCase() === "true";
+  if (seedEnabled) {
+    const reset = String(process.env.DB_SEED_RESET || "").toLowerCase() === "true";
+    if (reset) {
+      console.log("DB init: TEST reset requested (TRUNCATE + reseed)...");
+      await resetForTest();
+    }
+
+    // Seed only if it looks empty (or after reset)
+    const r = await query("SELECT COUNT(*)::int AS c FROM departments");
+    if (r.rows?.[0]?.c === 0) {
+      console.log("DB init: seeding TEST data...");
+      await runSqlFile("seed.sql");
+    } else if (reset) {
+      console.log("DB init: reseeding TEST data...");
+      await runSqlFile("seed.sql");
+    } else {
+      console.log("DB init: seed skipped (data already exists).");
+    }
+  }
+}
+
+module.exports = initSchema;
